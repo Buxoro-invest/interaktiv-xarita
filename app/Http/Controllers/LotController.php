@@ -6,6 +6,7 @@ use App\Models\Lot;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Cache;
 
 class LotController extends Controller
 {
@@ -44,24 +45,27 @@ class LotController extends Controller
 
     public function summary(): JsonResponse
     {
-        $verified = Lot::query()->whereNotNull('latitude')->whereNotNull('longitude');
-        $groups = (clone $verified)->select('group_name', DB::raw('count(*) as count'),
-            DB::raw('sum(start_price) as value'))->groupBy('group_name')->get();
-        $districts = (clone $verified)->select('district', DB::raw('count(*) as count'),
-            DB::raw('sum(start_price) as value'))->groupBy('district')->get()
-            ->map(function ($row) {
-                [$row->lat, $row->lng] = self::CENTERS[$row->district] ?? self::CENTERS['Buxoro viloyati'];
-                return $row;
-            });
-        return response()->json([
-            'total' => (clone $verified)->count(),
-            'catalog_total' => Lot::count(),
-            'total_value' => (float) (clone $verified)->sum('start_price'),
-            'with_images' => (clone $verified)->whereNotNull('image_url')->count(),
-            'groups' => $groups,
-            'districts' => $districts,
-            'updated_at' => now()->toIso8601String(),
-        ]);
+        return response()->json(Cache::remember('map.summary.v2', now()->addMinutes(10), function () {
+            $verified = Lot::query()->whereNotNull('latitude')->whereNotNull('longitude');
+            $groups = (clone $verified)->select('group_name', DB::raw('count(*) as count'),
+                DB::raw('sum(start_price) as value'))->groupBy('group_name')->get();
+            $districts = (clone $verified)->select('district', DB::raw('count(*) as count'),
+                DB::raw('sum(start_price) as value'))->groupBy('district')->get()
+                ->map(function ($row) {
+                    [$row->lat, $row->lng] = self::CENTERS[$row->district] ?? self::CENTERS['Buxoro viloyati'];
+                    return $row;
+                });
+
+            return [
+                'total' => (clone $verified)->count(),
+                'catalog_total' => Lot::count(),
+                'total_value' => (float) (clone $verified)->sum('start_price'),
+                'with_images' => (clone $verified)->whereNotNull('image_url')->count(),
+                'groups' => $groups,
+                'districts' => $districts,
+                'updated_at' => now()->toIso8601String(),
+            ];
+        }));
     }
 
     public function mapLots(Request $request): JsonResponse
@@ -76,22 +80,73 @@ class LotController extends Controller
         }
 
         $verifiedQuery = (clone $query)->whereNotNull('latitude')->whereNotNull('longitude');
-        $lots = $verifiedQuery->orderByDesc('id')->get([
-            'external_id', 'latitude', 'longitude',
-        ])->map(function (Lot $lot) {
-            $lot->lat = (float) $lot->latitude;
-            $lot->lng = (float) $lot->longitude;
-            $lot->makeHidden(['latitude', 'longitude']);
-            return $lot;
-        });
+        $total = (clone $verifiedQuery)->count();
+        $visibleQuery = clone $verifiedQuery;
+        if ($bounds = $this->boundsFrom($request)) {
+            $visibleQuery->whereBetween('latitude', [$bounds['south'], $bounds['north']])
+                ->whereBetween('longitude', [$bounds['west'], $bounds['east']]);
+        }
+
+        $zoom = max(5, min(18, (int) $request->query('zoom', 8)));
+        $viewportTotal = (clone $visibleQuery)->count();
+        if ($zoom < 12) {
+            $cellSize = match (true) {
+                $zoom <= 6 => 0.70,
+                $zoom === 7 => 0.32,
+                $zoom === 8 => 0.15,
+                $zoom === 9 => 0.075,
+                $zoom === 10 => 0.038,
+                default => 0.019,
+            };
+            $lots = $visibleQuery->get(['external_id', 'latitude', 'longitude'])
+                ->groupBy(fn (Lot $lot) => floor((float) $lot->latitude / $cellSize).':'.floor((float) $lot->longitude / $cellSize))
+                ->map(function ($cell) {
+                    $count = $cell->count();
+                    return [
+                        'type' => $count > 1 ? 'cluster' : 'lot',
+                        'count' => $count,
+                        'external_id' => $count === 1 ? (string) $cell->first()->external_id : null,
+                        'lat' => round((float) $cell->avg('latitude'), 7),
+                        'lng' => round((float) $cell->avg('longitude'), 7),
+                    ];
+                })->values();
+        } else {
+            $lots = $visibleQuery->orderByDesc('id')->limit(2500)->get([
+                'external_id', 'latitude', 'longitude',
+            ])->map(fn (Lot $lot) => [
+                'type' => 'lot',
+                'count' => 1,
+                'external_id' => (string) $lot->external_id,
+                'lat' => (float) $lot->latitude,
+                'lng' => (float) $lot->longitude,
+            ]);
+        }
 
         return response()->json([
             'data' => $lots,
-            'shown' => $lots->count(),
-            'total' => $lots->count(),
-            'approximate' => false,
+            'shown' => $zoom < 12 ? $viewportTotal : min($viewportTotal, 2500),
+            'rendered' => $lots->count(),
+            'total' => $total,
+            'approximate' => $zoom < 12,
+            'truncated' => $zoom >= 12 && $viewportTotal > 2500,
             'location_source' => 'e-auksion.uz lot-info',
         ]);
+    }
+
+    private function boundsFrom(Request $request): ?array
+    {
+        foreach (['south', 'north', 'west', 'east'] as $key) {
+            if (!$request->filled($key) || !is_numeric($request->query($key))) return null;
+        }
+        $south = max(-90, min(90, (float) $request->query('south')));
+        $north = max(-90, min(90, (float) $request->query('north')));
+        $west = max(-180, min(180, (float) $request->query('west')));
+        $east = max(-180, min(180, (float) $request->query('east')));
+
+        return [
+            'south' => min($south, $north), 'north' => max($south, $north),
+            'west' => min($west, $east), 'east' => max($west, $east),
+        ];
     }
 
     public function mapLot(string $externalId): JsonResponse

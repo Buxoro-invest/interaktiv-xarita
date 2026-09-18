@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 use App\Models\Lot;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Cache;
 
 class ImportEAuksionLots extends Command
 {
@@ -66,6 +67,7 @@ class ImportEAuksionLots extends Command
         }
         if ($rows) DB::table('lots')->insert($rows);
 
+        Cache::forget('map.summary.v2');
         $this->info('Import tugadi: '.Lot::count().' ta lot.');
         return self::SUCCESS;
     }
