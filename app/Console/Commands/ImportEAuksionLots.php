@@ -57,7 +57,9 @@ class ImportEAuksionLots extends Command
                 'location_verified_at' => ($latitude !== null && $longitude !== null) ? now() : null,
                 'raw' => json_encode($raw, JSON_UNESCAPED_UNICODE),
             ];
-            if (count($rows) === 500) {
+            // Keep each multi-row INSERT comfortably below MariaDB's
+            // max_allowed_packet even when lots contain large raw/polygon JSON.
+            if (count($rows) === 25) {
                 DB::table('lots')->insert($rows);
                 $rows = [];
             }
